@@ -1,0 +1,137 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: mixer_postgres
+    environment:
+      POSTGRES_USER: mixer
+      POSTGRES_PASSWORD: mixer_password
+      POSTGRES_DB: mixer_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - mixer_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mixer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and Celery broker
+  redis:
+    image: redis:7-alpine
+    container_name: mixer_redis
+    command: redis-server --requirepass redis_password
+    ports:
+      - "6379:6379"
+    networks:
+      - mixer_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Main Flask Application
+  web:
+    build: .
+    container_name: mixer_web
+    environment:
+      FLASK_ENV: production
+      DATABASE_URL: postgresql://mixer:mixer_password@postgres:5432/mixer_db
+      REDIS_URL: redis://:redis_password@redis:6379/0
+      CELERY_BROKER_URL: redis://:redis_password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:redis_password@redis:6379/2
+      SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
+      RPC_USER: ${RPC_USER}
+      RPC_PASS: ${RPC_PASS}
+      RPC_HOST: ${RPC_HOST:-host.docker.internal}
+      RPC_PORT: ${RPC_PORT:-8332}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mixer_network
+    volumes:
+      - ./logs:/app/logs
+    command: >
+      sh -c "
+        flask db upgrade &&
+        flask init-db &&
+        gunicorn --bind 0.0.0.0:5000 --workers 4 --timeout 120 mixer_service:app
+      "
+
+  # Celery Worker
+  celery_worker:
+    build: .
+    container_name: mixer_celery_worker
+    environment:
+      FLASK_ENV: production
+      DATABASE_URL: postgresql://mixer:mixer_password@postgres:5432/mixer_db
+      REDIS_URL: redis://:redis_password@redis:6379/0
+      CELERY_BROKER_URL: redis://:redis_password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:redis_password@redis:6379/2
+      SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
+      RPC_USER: ${RPC_USER}
+      RPC_PASS: ${RPC_PASS}
+      RPC_HOST: ${RPC_HOST:-host.docker.internal}
+      RPC_PORT: ${RPC_PORT:-8332}
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - mixer_network
+    volumes:
+      - ./logs:/app/logs
+    command: celery -A tasks.celery worker --loglevel=info
+
+  # Celery Beat Scheduler
+  celery_beat:
+    build: .
+    container_name: mixer_celery_beat
+    environment:
+      FLASK_ENV: production
+      DATABASE_URL: postgresql://mixer:mixer_password@postgres:5432/mixer_db
+      REDIS_URL: redis://:redis_password@redis:6379/0
+      CELERY_BROKER_URL: redis://:redis_password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:redis_password@redis:6379/2
+      SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - mixer_network
+    command: celery -A tasks.celery beat --loglevel=info
+
+  # Nginx Reverse Proxy (Optional - for production)
+  nginx:
+    image: nginx:alpine
+    container_name: mixer_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - web
+    networks:
+      - mixer_network
+
+networks:
+  mixer_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
